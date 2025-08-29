@@ -34,7 +34,7 @@ fn extract_boundary(media_type: &str) -> Option<String> {
 
 struct FormData {
     file_data: Option<Vec<u8>>,
-    hanlde_as: Option<String>,
+    handle_as: Option<String>,
 }
 
 fn find_parts(body: &[u8], boundary: &str) -> Vec<(usize, usize)> {
@@ -86,7 +86,7 @@ fn find_parts(body: &[u8], boundary: &str) -> Vec<(usize, usize)> {
 fn parse_multipart_form(body: &[u8], boundary: &str) -> FormData {
     let mut form_data = FormData {
         file_data: None,
-        hanlde_as: None,
+        handle_as: None,
     };
 
     let parts = find_parts(body, boundary);
@@ -114,7 +114,7 @@ fn parse_multipart_form(body: &[u8], boundary: &str) -> FormData {
                     form_data.file_data = Some(part[content_start..content_end].to_vec());
                 }
             }
-            else if headers_str.contains(r#"name="hanlde_as""#) {
+            else if headers_str.contains(r#"name="handle_as""#) {
                 let mut content_end = part.len();
                 
                 if content_end >= 2 && &part[content_end-2..content_end] == b"\r\n" {
@@ -124,10 +124,10 @@ fn parse_multipart_form(body: &[u8], boundary: &str) -> FormData {
                 }
                 
                 if content_start < content_end {
-                    let hanlde_as_value = String::from_utf8_lossy(&part[content_start..content_end])
+                    let handle_as_value = String::from_utf8_lossy(&part[content_start..content_end])
                         .trim()
                         .to_string();
-                    form_data.hanlde_as = Some(hanlde_as_value);
+                    form_data.handle_as = Some(handle_as_value);
                 }
             }
         }
@@ -197,9 +197,9 @@ async fn requests(
                         return Ok(responses::internal_server_error());
                     }
 
-                    if let Some(hanlde_as) = form_data.hanlde_as {
-                        if hanlde_as == "comup" || hanlde_as == "uncup" {
-                            println!("⚙️ Handling as: {}", hanlde_as);
+                    if let Some(handle_as) = form_data.handle_as {
+                        if handle_as == "comup" || handle_as == "uncup" {
+                            println!("⚙️ Handling as: {}", handle_as);
                         } else {
                             return Ok(responses::internal_server_error());
                         }
