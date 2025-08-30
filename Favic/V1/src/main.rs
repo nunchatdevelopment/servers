@@ -51,35 +51,11 @@ struct FormData {
     handle_as: Option<String>,
 }
 
-fn test_response() -> Response<BoxBody> {
-    let json_response = json!({
-        "status": "success",
-        "message": "Server is working correctly!",
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-        "endpoints": {
-            "test": "GET /test - This endpoint",
-            "health": "GET /health - Health check",
-            "upload": "POST /upload - File upload endpoint"
-        }
-    });
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/json")
-        .body(full(json_response.to_string()))
-        .unwrap()
-}
-  
-
 async fn requests(
     req: Request<IncomingBody>,
 ) -> std::result::Result<Response<BoxBody>, Infallible> {
     let (parts, body) = req.into_parts();
     let response = match (parts.method, parts.uri.path()) {
-        (&hyper::Method::GET, "/test") => {
-            println!("🧪 Test endpoint accessed");
-            test_response()
-        }
         
         (hyper::Method::POST, "/upload") => {
             let content_type = parts
