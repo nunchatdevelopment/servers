@@ -59,17 +59,7 @@ async fn requests(
 
         (hyper::Method::GET, "/test") => {
             println!("🧪 Test route accessed");
-            let response_body = json!({
-                "status": "ok",
-                "message": "Server is working!",
-                "timestamp": chrono::Utc::now().to_rfc3339()
-            });
-            
-            Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "application/json")
-                .body(full(response_body.to_string()))
-                .unwrap()
+            Ok(responses::internal_server_error());
         }
         
         (hyper::Method::POST, "/upload") => {
