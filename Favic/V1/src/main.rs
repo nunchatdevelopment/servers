@@ -12,8 +12,10 @@ use hyper_util::server::conn::auto;
 use serde_json::json;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use tokio::fs;
 use tokio::net::TcpListener;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::ptr;
+use memmap2::MmapMut;
 
 fn full<T: Into<bytes::Bytes>>(chunk: T) -> BoxBody {
     http_body_util::Full::new(chunk.into())
@@ -21,219 +23,192 @@ fn full<T: Into<bytes::Bytes>>(chunk: T) -> BoxBody {
         .boxed()
 }
 
-fn extract_boundary(media_type: &str) -> Option<String> {
-    media_type.split(';').find_map(|part| {
-        let trimmed = part.trim();
-        if trimmed.starts_with("boundary=") {
-            Some(trimmed[9..].trim_matches('"').to_string())
+static FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn ultra_fast_boundary_search(data: &[u8], boundary: &[u8]) -> Vec<usize> {
+    let mut positions = Vec::new();
+    if boundary.is_empty() || data.len() < boundary.len() {
+        return positions;
+    }
+    
+    let mut i = 0;
+    let boundary_len = boundary.len();
+    let data_len = data.len();
+    
+    while i <= data_len - boundary_len {
+        if data[i..i + boundary_len] == *boundary {
+            positions.push(i);
+            i += boundary_len;
         } else {
-            None
+            i += 1;
         }
-    })
+    }
+    
+    positions
 }
 
 struct FormData {
-    file_data: Option<Vec<u8>>,
     handle_as: Option<String>,
-}
-
-fn find_parts(body: &[u8], boundary: &str) -> Vec<(usize, usize)> {
-    let mut parts = Vec::new();
-    let boundary_marker = format!("--{}", boundary).into_bytes();
-    let final_boundary = format!("--{}--", boundary).into_bytes();
-    
-    let mut start = 0;
-    while start < body.len() {
-        if let Some(pos) = body[start..].windows(boundary_marker.len())
-            .position(|window| window == &boundary_marker[..]) {
-            
-            let boundary_start = start + pos;
-            let content_start = boundary_start + boundary_marker.len();
-            
-            let mut actual_start = content_start;
-            if actual_start < body.len() && body[actual_start] == b'\r' {
-                actual_start += 1;
-            }
-            if actual_start < body.len() && body[actual_start] == b'\n' {
-                actual_start += 1;
-            }
-            
-            let next_boundary = body[actual_start..].windows(boundary_marker.len())
-                .position(|window| window == &boundary_marker[..])
-                .map(|p| actual_start + p);
-            
-            let final_boundary_pos = body[actual_start..].windows(final_boundary.len())
-                .position(|window| window == &final_boundary[..])
-                .map(|p| actual_start + p);
-            
-            let end = next_boundary
-                .or(final_boundary_pos)
-                .unwrap_or(body.len());
-            
-            if actual_start < end {
-                parts.push((actual_start, end));
-            }
-            
-            start = end;
-        } else {
-            break;
-        }
-    }
-    
-    parts
-}
-
-fn parse_multipart_form(body: &[u8], boundary: &str) -> FormData {
-    let mut form_data = FormData {
-        file_data: None,
-        handle_as: None,
-    };
-
-    let parts = find_parts(body, boundary);
-    
-    for (start, end) in parts {
-        let part = &body[start..end];
-        
-        if let Some(header_end_pos) = part.windows(4)
-            .position(|window| window == b"\r\n\r\n") {
-            
-            let headers = &part[..header_end_pos];
-            let headers_str = String::from_utf8_lossy(headers);
-            let content_start = header_end_pos + 4;
-            
-            if headers_str.contains("filename=") {
-                let mut content_end = part.len();
-                
-                if content_end >= 2 && &part[content_end-2..content_end] == b"\r\n" {
-                    content_end -= 2;
-                } else if content_end >= 1 && part[content_end-1] == b'\n' {
-                    content_end -= 1;
-                }
-                
-                if content_start < content_end {
-                    form_data.file_data = Some(part[content_start..content_end].to_vec());
-                }
-            }
-            else if headers_str.contains(r#"name="handle_as""#) {
-                let mut content_end = part.len();
-                
-                if content_end >= 2 && &part[content_end-2..content_end] == b"\r\n" {
-                    content_end -= 2;
-                } else if content_end >= 1 && part[content_end-1] == b'\n' {
-                    content_end -= 1;
-                }
-                
-                if content_start < content_end {
-                    let handle_as_value = String::from_utf8_lossy(&part[content_start..content_end])
-                        .trim()
-                        .to_string();
-                    form_data.handle_as = Some(handle_as_value);
-                }
-            }
-        }
-    }
-
-    form_data
-}
-
-fn test_response() -> Response<BoxBody> {
-    let json_response = json!({
-        "status": "success",
-        "message": "Server is working correctly!",
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-        "endpoints": {
-            "test": "GET /test - This endpoint",
-            "health": "GET /health - Health check",
-            "upload": "POST /upload - File upload endpoint"
-        }
-    });
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/json")
-        .body(full(json_response.to_string()))
-        .unwrap()
 }
 
 async fn requests(
     req: Request<IncomingBody>,
 ) -> std::result::Result<Response<BoxBody>, Infallible> {
-    let response = match (req.method(), req.uri().path()) {
-
-        (&hyper::Method::GET, "/test") => {
-            println!("🧪 Test endpoint accessed");
-            test_response()
-        }
-        
-        (&hyper::Method::POST, "/upload") => {
-            let send_type = req
-                .headers()
+    let (parts, body) = req.into_parts();
+    let response = match (parts.method, parts.uri.path()) {
+        (hyper::Method::POST, "/upload") => {
+            let content_type = parts
+                .headers
                 .get("content-type")
                 .and_then(|ct| ct.to_str().ok())
-                .unwrap_or("")
-                .to_string();
+                .unwrap_or("");
 
-            println!("Upload type: {:?}", req.headers());
-
-            let body = match req.collect().await {
-                Ok(collected) => collected.to_bytes(),
-                Err(_) => {
-                    return Ok(responses::internal_server_error());
-                }
-            };
-
-            if send_type.starts_with("multipart/form-data") {
-                if let Some(boundary) = extract_boundary(&send_type) {
-                    let form_data = parse_multipart_form(&body, &boundary);
-
-                    if let Some(ref file_buffer) = form_data.file_data {
-                        if let Err(e) = fs::write("uploaded_file.jpg", file_buffer).await {
-                            eprintln!("Failed to save file: {}", e);
-                            return Ok(responses::internal_server_error());
-                        }
-                        println!("✅ File saved successfully! Size: {} bytes", file_buffer.len());
-                    } else {
-                        println!("❌ No file data found");
-                        return Ok(responses::internal_server_error());
-                    }
-
-                    if let Some(handle_as) = form_data.handle_as {
-                        if handle_as == "comup" || handle_as == "uncup" {
-                            println!("⚙️ Handling as: {}", handle_as);
-                        } else {
-                            return Ok(responses::internal_server_error());
-                        }
-                    } else {
-                        return Ok(responses::internal_server_error());
-                    }
-                } else {
-                    return Ok(responses::internal_server_error());
-                }
-            } else {
+            if !content_type.starts_with("multipart/form-data") {
                 return Ok(responses::internal_server_error());
             }
 
-            return Ok(responses::ok());
+            let boundary = content_type
+                .split("boundary=")
+                .nth(1)
+                .and_then(|b| b.split(';').next())
+                .map(|b| b.trim_matches('"'))
+                .unwrap_or("");
+
+            if boundary.is_empty() {
+                return Ok(responses::internal_server_error());
+            }
+
+            let body_bytes = match body.collect().await {
+                Ok(collected) => collected.to_bytes(),
+                Err(_) => return Ok(responses::internal_server_error()),
+            };
+            
+            let boundary_bytes = format!("--{}", boundary).into_bytes();
+            let positions = ultra_fast_boundary_search(&body_bytes, &boundary_bytes);
+            
+            if positions.len() < 2 {
+                return Ok(responses::internal_server_error());
+            }
+            
+            let mut form_data = FormData { handle_as: None };
+            let mut file_saved = false;
+            let mut file_data: Option<&[u8]> = None;
+            
+            for i in 0..positions.len() - 1 {
+                let start = positions[i] + boundary_bytes.len();
+                let end = positions[i + 1];
+                
+                if start >= end || start >= body_bytes.len() {
+                    continue;
+                }
+                
+                let part = &body_bytes[start..end];
+                
+                if let Some(header_end) = part.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = &part[..header_end];
+                    let content_start = header_end + 4;
+                    let mut content_end = part.len();
+                    
+                    if content_end >= 2 && &part[content_end-2..content_end] == b"\r\n" {
+                        content_end -= 2;
+                    }
+                    
+                    let headers_str = unsafe { std::str::from_utf8_unchecked(headers) };
+                    
+                    if headers_str.contains("filename=") {
+                        if content_start < content_end {
+                            file_data = Some(&part[content_start..content_end]);
+                        }
+                    } else if headers_str.contains(r#"name="handle_as""#) {
+                        if content_start < content_end {
+                            let value = unsafe { std::str::from_utf8_unchecked(&part[content_start..content_end]) }.trim();
+                            if value == "comup" || value == "uncup" {
+                                form_data.handle_as = Some(value.to_string());
+                            } else {
+                                return Ok(responses::internal_server_error());
+                            }
+                        }
+                    }
+                }
+            }
+            
+            if let Some(file_bytes) = file_data {
+                let file_id = FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let filename = format!("uploaded_file_{}.mp4", file_id);
+                
+                match std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&filename) {
+                    Ok(_file) => {
+                        let mut mmap = match MmapMut::map_anon(file_bytes.len()) {
+                            Ok(mmap) => mmap,
+                            Err(_) => return Ok(responses::internal_server_error()),
+                        };
+                        
+                        unsafe {
+                            ptr::copy_nonoverlapping(
+                                file_bytes.as_ptr(),
+                                mmap.as_mut_ptr(),
+                                file_bytes.len()
+                            );
+                        }
+                        
+                        if let Err(_) = std::fs::write(&filename, &*mmap) {
+                            return Ok(responses::internal_server_error());
+                        }
+                        
+                        println!("⚡ Ultra-fast file saved: {} (Size: {} bytes)", filename, file_bytes.len());
+                        file_saved = true;
+                    }
+                    Err(_) => {
+                        return Ok(responses::internal_server_error());
+                    }
+                }
+            }
+
+            if !file_saved {
+                println!("❌ No file data found");
+                return Ok(responses::internal_server_error());
+            }
+
+            if form_data.handle_as.is_none() {
+                return Ok(responses::internal_server_error());
+            }
+
+            println!("⚙️ Handling as: {:?}", form_data.handle_as);
+            Ok(responses::ok())
         }
 
-        _ => responses::internal_server_error(),
+        _ => Ok(responses::internal_server_error()),
     };
 
-    Ok(response)
+    response
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let addr: SocketAddr = "0.0.0.0:3000".parse()?;
     let listener = TcpListener::bind(addr).await?;
-    println!("🚀 Server listening on http://192.168.148.126:3000");
+    println!("Server Running");
 
     loop {
         let (tcp, _peer_addr) = listener.accept().await?;
+        
+        tcp.set_nodelay(true).ok();
+        
         let io = TokioIo::new(tcp);
 
         tokio::task::spawn(async move {
             if let Err(err) = auto::Builder::new(TokioExecutor::new())
+                .http2()
+                .enable_connect_protocol()
+                .max_send_buf_size(1024 * 1024)
+                .initial_stream_window_size(Some(1024 * 1024))
+                .initial_connection_window_size(Some(2 * 1024 * 1024))
+                .adaptive_window(true)
+                .max_frame_size(Some(16384))
                 .serve_connection(io, service_fn(requests))
                 .await
             {
