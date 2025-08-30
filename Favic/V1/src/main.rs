@@ -56,6 +56,21 @@ async fn requests(
 ) -> std::result::Result<Response<BoxBody>, Infallible> {
     let (parts, body) = req.into_parts();
     let response = match (parts.method, parts.uri.path()) {
+
+        (hyper::Method::GET, "/test") => {
+            println!("🧪 Test route accessed");
+            let response_body = json!({
+                "status": "ok",
+                "message": "Server is working!",
+                "timestamp": chrono::Utc::now().to_rfc3339()
+            });
+            
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json")
+                .body(full(response_body.to_string()))
+                .unwrap()
+        }
         
         (hyper::Method::POST, "/upload") => {
             let content_type = parts
