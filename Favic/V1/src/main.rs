@@ -59,7 +59,7 @@ async fn requests(
 
         (hyper::Method::GET, "/test") => {
             println!("🧪 Test route accessed");
-            Ok(responses::internal_server_error());
+            return Ok(responses::internal_server_error());
         }
         
         (hyper::Method::POST, "/upload") => {
