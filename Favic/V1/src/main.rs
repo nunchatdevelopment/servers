@@ -67,6 +67,8 @@ fn test_response() -> Response<BoxBody> {
         .status(StatusCode::OK)
         .header("content-type", "application/json")
         .body(full(json_response.to_string()))
+        .unwrap()
+}
   
 
 async fn requests(
