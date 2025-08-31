@@ -155,15 +155,32 @@ pub async fn download_file_from_r2(
     let body_bytes = get_object_output.body.collect().await?.into_bytes();
     
     let filename = request.path.split('/').last().unwrap_or("download");
+    let local_path = format!("downloads/{}", filename);
+    
+    tokio::fs::create_dir_all("downloads").await?;
+    
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&local_path)
+        .await?;
+    
+    file.write_all(&body_bytes).await?;
+    file.flush().await?;
+    
+    let response = json!({
+        "status": "success",
+        "message": "File downloaded to server",
+        "local_path": local_path,
+        "size": content_length
+    });
     
     Ok(Response::builder()
         .status(StatusCode::OK)
-        .header("content-type", "application/octet-stream")
-        .header("content-disposition", format!("attachment; filename=\"{}\"", filename))
-        .header("content-length", content_length.to_string())
+        .header("content-type", "application/json")
         .header("server", "ultra-fast-http2/1.0")
-        .header("x-download-speed", "ultra-fast")
-        .body(full(body_bytes))
+        .body(full(response.to_string()))
         .unwrap())
 }
 
